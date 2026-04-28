@@ -1,6 +1,8 @@
 # Machine Learning for Credit Prediction: Phase 4
 ## The Evolution of Credit Scoring Under SR 26-2 
 
+![Infographic: Design Overview](infographic.png)
+
 ---
 
 ### Background and Aim 
