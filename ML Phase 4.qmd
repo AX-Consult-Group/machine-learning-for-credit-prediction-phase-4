@@ -1,0 +1,845 @@
+---
+title: "The Evolution of Credit Scoring Under SR 26-2: Phase 4"
+authors: Caitlin Buenk, Tilabo Williamson, and Jurgen Becker (Project Lead) - AX Consult Group. 
+format:
+  html:
+    theme: cosmo
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    fig-width: 8
+    fig-height: 5
+    output-dir: docs
+execute:
+  warning: false
+  message: false
+  error: true
+---
+
+::: {.text-center style="margin-bottom: 2em;"}
+![](company-logo.png){width="180" fig-align="center"}
+:::
+
+### Background and Aim 
+
+In the third phase of this project, we deployed the ML-informed Logistic Regression (LR) — a hybrid development methodology that uses Machine Learning (ML) techniques during the feature engineering phase to discover which non-linear effects and feature interactions carry genuine predictive signal. Those discovered patterns were then encoded as explicit, fixed terms inside a production logistic regression, preserving full coefficient transparency and regulatory auditability.
+
+In principle, this approach gives us the best of both worlds: The feature engineering intelligence of ML combined with the regulatory defensibility of a traditional scorecard. The resulting model is static (every predictor carries a fixed, interpretable coefficient) and thus capable of withstanding regulatory review or legal challenge — a requirement that purely dynamic ML models cannot satisfy in most regulated lending environments.
+
+In practice, however, the richness we mined from the ML layer was significantly eroded when we moved into the logistic regression decision layer due to collinearity (substantial overlapping variance) between psychometric variables. This meant that when we introduced the ML-derived interaction terms and non-linear composites alongside main effects, the model became unstable. The only path to a stable model was to strip the feature set back to main effects, removing most of the engineered variables the ML phase had identified as predictive. Consequently, the richer representation of borrower behavior was effectively lost in the translation to a stable LR.
+
+The recent issuance of **SR 26-2** (April 2026), which revises and supersedes the previous SR 11-7 framework, introduces a more risk-based and proportionate approach to Model Risk Management (MRM). While core expectations for governance, validation, and effective challenge remain firmly in place, the updated guidance provides banking organizations with greater flexibility. This represents a meaningful evolution from the more uniform expectations under SR 11-7, enabling responsible innovation in the use of advanced statistical and non-generative AI and ML techniques.
+
+In this context, the aim of the fourth and final phase of this project is to explore how psychometric signals can be transformed into a regulator-ready decision layer while simultaneously maintaining the feature richness typically associated with advanced ML techniques. By applying hybrid methodologies, this phase demonstrates a practical way to balance predictive power, interpretability, and regulatory compliance in line with the principles outlined in SR 26-2.
+
+### Methods
+
+To address the core challenge of balancing feature richness (from the ML discovery phase) with model stability and regulatory explainability, Phase 4 applied a structured sequence of statistical transformations and modelling techniques to the psychometric DRA higher-order factors and their interactions.
+
+The following approaches were tested and evaluated:
+
+- Standardisation (centering and scaling) of all DRA factors to improve numerical stability and facilitate safe creation of interaction terms.
+
+- Residualisation (orthogonalisation) — evaluated as an alternative (or complementary) technique to reduce multicollinearity between correlated psychometric dimensions.
+
+- Interaction Discovery and Controlled Inclusion — using XGBoost for feature importance and SHAP interaction values to identify high-value pairwise interactions, followed by careful shortlisting and testing.
+
+- Weight of Evidence (WOE) Binning — diagnostically evaluated on both main effects and interactions to assess potential benefits in monotonicity and interpretability.
+
+- Penalised Logistic Regression to handle remaining multicollinearity while performing automatic feature selection.
+
+- Bayesian Logistic Regression — fitted as a robustness check using weakly informative priors to validate coefficient stability and provide credible intervals.
+
+- PD Calibration and Scorecard Development — Platt scaling followed by conversion to a 0–1000 points-based scorecard with six risk rating bands (A to F).
+
+This hybrid pipeline was executed exclusively on the development sample, with all transformations and parameters strictly applied to the hold-out test set to prevent data leakage. The goal was to transform rich ML-derived psychometric signals into a stable, transparent, and regulator-ready logistic regression decision layer.
+
+### Data
+
+This analysis uses real **psychometric assessment data**. The scores have been scaled such that risk reduces as the score increases. Additionally, the scores were mapped to a range of 0 to 100.
+
+To protect intellectual property, the names of the DRA variables have been generalized or renamed in this public version. The underlying constructs and relationships remain representative of the actual assessment.
+
+**All financial data** (accounts, arrears, age on book, bad outcome) is simulated to match realistic distributions, correlations, and patterns from the original analysis (based on a South African thin-file population). The bad outcome (default, bad = 1) was defined as ≥2 payments missed within 6 months, with an overall bad rate of 24.2% in the final population.
+
+No real candidate or client information is included.
+
+### Analyses
+
+```{r}
+library(pacman)
+
+p_load(dplyr, readxl, writexl, ggplot2, tidyr, lavaan, psych, tidyverse, knitr, ggcorrplot, jtools, Hmisc, rempsyc, stringr, kableExtra, lm.beta, broom, lmtest, scorecard, car, caret, xgboost, vip, shapviz, glmnet, pROC, brms, scales) 
+
+raw_data <- readxl::read_excel("DRA_with_simulated_credit.xlsx")
+```
+
+```{r}
+modeling_data <- raw_data %>%
+  # 1. No arrears at assessment (worst_arrears_assess == 0)
+  filter(worst_arrears_assess == 0) %>%
+  
+  # 2. Not very credit active at assessment (≤ 4 accounts)
+  filter(num_accounts_assess <= 4) %>%
+  
+  # 3. Not very credit active at performance (≤ 5 accounts)
+  filter(num_accounts_perf <= 5) %>%
+  
+  # 4. Accounts old enough to observe repayment (≥ 3 months on book)
+  filter(age_oldest_perf >= 3) %>%
+  
+  # 5. Had some credit activity to evaluate (at least one account at assess OR perf)
+  filter(num_accounts_assess > 0 | num_accounts_perf > 0)
+
+modeling_data <- modeling_data %>% 
+  na.omit()
+
+final_data <- modeling_data %>% 
+  dplyr::mutate(Dummy_ID = as.factor(Dummy_ID),
+                product_type = as.factor(product_type))
+```
+
+This analysis uses the same modelling population (13,136 records) as the previous projects. The dataset was split into a 70/30 development (train) and hold-out test set using stratified sampling on the binary target to preserve the bad rate distribution. All subsequent feature engineering, interaction discovery, and model fitting were performed exclusively on the train set to prevent data leakage. The test set was reserved for final out-of-sample validation.
+
+```{r}
+set.seed(123)      
+target_var <- "bad"   
+
+# Stratified split: 70% train, 30% test
+train_index <- createDataPartition(final_data[[target_var]], 
+                                   p = 0.70, 
+                                   list = FALSE, 
+                                   times = 1)
+
+data_train <- final_data[train_index, ]
+data_test  <- final_data[-train_index, ]
+
+cat("Train set size:", nrow(data_train), "\n")
+cat("Test set size: ", nrow(data_test), "\n")
+cat("Bad rate - Train:", mean(data_train[[target_var]], na.rm = TRUE), "\n")
+cat("Bad rate - Test: ", mean(data_test[[target_var]], na.rm = TRUE), "\n")
+```
+### Feature Preparation
+
+```{r}
+# Extracting DRA Higher-Order Factors
+predictors_factor <- grep("^R_HO_", names(final_data), value = TRUE)
+target_var <- "bad"
+```
+
+#### Univariate Information Value (IV) Screening
+
+Information Value (IV) is used to measure the predictive power of an independent variable in explaining a binary dependent variable. IV screening was applied to the raw higher-order DRA factors (before applying any transformations) to identify which variables strongly predict the bad outcome (default, bad = 1) and to potentially exclude weak or irrelevant predictors. 
+
+All variables had an IV > 0.02. As a result, no higher-order factors were excluded as predictors (n = 13). Notably, only one factor (R_HO_VI1_CN) was identified as a weak predictor (IV < 0.1); all other predictors were identified as having medium (0.1 to 0.3) to strong (0.3 to 0.5) predictive power. 
+
+```{r}
+# Calculate Information Value for all DRA higher-order factors
+iv_results <- iv(data_train, y = target_var, x = predictors_factor)
+
+# Sort by strength
+iv_results <- iv_results[order(-iv_results$info_value), ]
+
+kable(
+  iv_results,
+  digits = 3,
+  col.names = c("DRA Variable", "Information Value"),) %>% 
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# Determine threshold (> 0.02 = keep)
+iv_threshold <- 0.02
+keepers <- iv_results$variable[iv_results$info_value > iv_threshold]
+```
+
+#### Centering / Standardisation 
+
+In the next step, the higher-order DRA factors were standardized (centered and scaled to mean = 0, SD = 1) on the train sample only. The same centering and scaling parameters were then applied to the hold-out test set. 
+
+**Rationale for Standardisation** 
+
+Standardisation serves several critical purposes in this hybrid modelling pipeline:
+
+1. Facilitates stable and interpretable interaction terms
+
+When creating interaction terms, standardisation ensures that the main effects and their interactions are placed on comparable scales. Without standardisation, interaction terms can become highly correlated with their constituent main effects, leading to severe multicollinearity, unstable coefficients, and sign reversals. By standardising first, the resulting interaction terms exhibit much lower collinearity with the main effects, allowing the model to better isolate the unique synergistic effects.
+
+2. Improves numerical stability and model convergence
+
+Penalised models such as Elastic Net are sensitive to differences in variable scales. Standardisation places all predictors on a common scale, enabling the regularisation penalty to treat all features more equitably.
+
+3. Enhances coefficient interpretability
+
+After standardisation, each coefficient represents the change in log-odds of default associated with a one standard deviation increase in that predictor (or interaction), making results easier to interpret and compare across variables.
+
+This step is essential for successfully carrying forward the rich interaction patterns discovered by ML techniques into a stable, regulator-friendly logistic regression framework.
+
+```{r}
+# Center / Standardize (mean=0, sd=1) continuous DRA variables on train
+psych_vars <- keepers     
+
+preProc <- preProcess(data_train[psych_vars], method = c("center", "scale"))
+
+data_train_std <- data_train
+data_train_std[psych_vars] <- predict(preProc, data_train[psych_vars])
+
+# Apply to the test set
+data_test_std <- data_test
+data_test_std[psych_vars] <- predict(preProc, data_test[psych_vars])
+```
+
+**Diagnostic Checks** 
+
+```{r}
+# Checking correlations between HO factors
+cor_matrix <- cor(data_train_std[psych_vars], use = "pairwise.complete.obs")
+
+kable(
+  cor_matrix,
+  digits = 2,
+  caption = "Correlations Between DRA Higher-Order Factors"
+) %>% 
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+```
+
+All pairwise correlations among the DRA higher-order factors are low and far below the typical red-flag thresholds of 0.6–0.8 where multicollinearity becomes a serious issue.
+
+```{r}
+# Quick VIF check on a simple model: Values > 5–10 indicate problematic multicollinearity
+model_check <- glm(bad ~ ., data = data_train_std[, c("bad", psych_vars)], family = binomial)
+
+kable(vif(model_check),
+      digits = 3,
+      col.names = c("DRA Variable", "VIF"),
+      caption = "Variance Inflation Factor") %>%     
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+The Variance Inflation Factor (VIF) measures how much the variance of an estimated regression coefficient is increased due to collinearity (multicollinearity) between independent variables. There is no evidence of problematic multicollinearity (no VIF values > 5) among the higher-order DRA factors at this stage. This suggests that these variables capture relatively distinct aspects of the psychometric profile. 
+
+#### Residualisation (orthogonalisation)
+
+As an alternative (or complementary) technique to manage potential multicollinearity between correlated psychometric factors, residualisation (also known as orthogonalisation) can be applied. This method involves regressing one variable on another and retaining the residuals, which represent the unique variance not explained by the reference variable.
+
+In this project, residualisation was not applied to the higher-order DRA factors. Diagnostic checks revealed low pairwise correlations and very low Variance Inflation Factors (all VIF < 1.25). This indicated that these variables already captured sufficiently distinct dimensions, making further orthogonalisation unnecessary.
+
+However, residualisation remains a powerful and commonly used approach in psychometric credit scoring when higher overlap exists and helps isolate unique predictive contributions while preserving interpretability.
+
+```{r}
+# Optional: Residualisation against a reference factor
+reference_var <- "R_HO_JD_CM"   # Choose the broadest or highest-IV factor
+
+to_residualise <- setdiff(psych_vars, reference_var)
+
+data_train_resid <- data_train
+data_test_resid  <- data_test
+
+for (var in to_residualise) {
+  formula_str <- paste(var, "~", reference_var)
+  model <- lm(as.formula(formula_str), 
+              data = data_train_resid, 
+              na.action = na.exclude)
+  
+  resid_name <- paste0(var, "_Resid")
+  
+  data_train_resid[[resid_name]] <- residuals(model)
+  data_test_resid[[resid_name]]  <- predict(model, newdata = data_test_resid) - 
+                                    data_test_resid[[var]]
+}
+```
+
+### XGBoost Interaction Discovery 
+
+An XGBoost gradient boosting model was trained on the standardized DRA higher-order factors in the development (train) sample. The purpose of this step was to discover non-linear effects and pairwise interactions that carry genuine additional predictive signal beyond the individual main effects.
+
+```{r}
+# XGBoost for interaction discovery (on standardised train data)
+
+X_train <- as.matrix(data_train_std[, psych_vars])
+y_train <- data_train_std[[target_var]]
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+
+# Train XGBoost 
+xgb_model <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    nthread = 8,
+    seed = 123
+  ),
+  data = dtrain,
+  nrounds = 300,
+  verbose = 0
+)
+```
+
+**Discovery of Feature Interactions and Non-Linear Relationships**
+
+The SHAP Interaction Plot below displays the mean absolute SHAP interaction value for each term. 
+
+- Bars showing a single variable name (e.g., R_HO_EM2_CO) represent the main effect contribution.
+
+- Bars showing two variable names separated by a colon (e.g., R_HO_JD_CM:R_HO_EM1_ES) represent the pairwise interaction strength between those two variables.
+
+The height of each bar indicates how much that term (main effect or interaction) contributes, on average, to shifting the model’s prediction (log-odds of default) across all observations. Higher bars mean stronger predictive importance, including synergistic effects that only appear when two variables are considered together.
+
+This plot is particularly valuable because it isolates the additional predictive power coming from interactions, helping us avoid adding weak or redundant terms that could de-stabilise the logistic regression.
+
+```{r}
+shp <- shapviz(
+  xgb_model,
+  X_pred = X_train,          
+  X = data_train_std[, psych_vars],   
+  interactions = TRUE        
+)
+
+# Interaction Summary Plot 
+interaction_plot <- sv_interaction(shp, 
+                                   kind = "bar",
+                                   max_display = 15) +
+  ggtitle("SHAP Interaction Summary Plot") +
+  theme_minimal() +
+    theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(interaction_plot)
+```
+
+**Interaction Shortlisting Process**
+
+From the SHAP interaction plot, the following six strongest pairwise interactions were selected for inclusion in the final model (ranked by descending interaction strength):
+
+1. R_HO_JD_CM × R_HO_EM1_ES
+
+2. R_HO_TC3_DI × R_HO_JD_CM
+
+3. R_HO_EM2_CO × R_HO_VI4_ST
+
+4. R_HO_TC3_DI × R_HO_TC2_OC
+
+5. R_HO_EM1_ES × R_HO_TC1_AG
+
+6. R_HO_JD_CM × R_HO_TC2_OC
+
+These six shortlisted interaction terms were then created as explicit product terms on both the train and test sets.
+
+```{r}
+# Create interaction terms on BOTH train and test (after standardisation)
+data_train_final <- data_train_std
+data_test_final  <- data_test_std
+
+# Shortlisted interactions
+data_train_final$R_HO_JD_CM_x_EM1_ES   <- data_train_final$R_HO_JD_CM   * data_train_final$R_HO_EM1_ES
+data_test_final$R_HO_JD_CM_x_EM1_ES    <- data_test_final$R_HO_JD_CM    * data_test_final$R_HO_EM1_ES
+
+data_train_final$R_HO_TC3_DI_x_JD_CM   <- data_train_final$R_HO_TC3_DI * data_train_final$R_HO_JD_CM
+data_test_final$R_HO_TC3_DI_x_JD_CM    <- data_test_final$R_HO_TC3_DI  * data_test_final$R_HO_JD_CM
+
+data_train_final$R_HO_EM2_CO_x_VI4_ST  <- data_train_final$R_HO_EM2_CO * data_train_final$R_HO_VI4_ST
+data_test_final$R_HO_EM2_CO_x_VI4_ST   <- data_test_final$R_HO_EM2_CO  * data_test_final$R_HO_VI4_ST
+
+data_train_final$R_HO_TC3_DI_x_TC2_OC  <- data_train_final$R_HO_TC3_DI * data_train_final$R_HO_TC2_OC
+data_test_final$R_HO_TC3_DI_x_TC2_OC   <- data_test_final$R_HO_TC3_DI  * data_test_final$R_HO_TC2_OC
+
+data_train_final$R_HO_EM1_ES_x_TC1_AG  <- data_train_final$R_HO_EM1_ES * data_train_final$R_HO_TC1_AG
+data_test_final$R_HO_EM1_ES_x_TC1_AG   <- data_test_final$R_HO_EM1_ES  * data_test_final$R_HO_TC1_AG
+
+data_train_final$R_HO_JD_CM_x_TC2_OC   <- data_train_final$R_HO_JD_CM  * data_train_final$R_HO_TC2_OC
+data_test_final$R_HO_JD_CM_x_TC2_OC    <- data_test_final$R_HO_JD_CM   * data_test_final$R_HO_TC2_OC
+```
+
+Because the main effects were already standardized, the resulting interaction terms exhibit low collinearity with their constituent main effects. 
+
+```{r}
+predictors_for_vif <- c(psych_vars, 
+                        "R_HO_JD_CM_x_EM1_ES", "R_HO_TC3_DI_x_JD_CM",
+                        "R_HO_EM2_CO_x_VI4_ST", "R_HO_TC3_DI_x_TC2_OC",
+                        "R_HO_EM1_ES_x_TC1_AG", "R_HO_JD_CM_x_TC2_OC")
+
+model_check <- glm(bad ~ ., 
+                   data = data_train_final[, c("bad", predictors_for_vif)], 
+                   family = binomial)
+
+vif_values <- vif(model_check)
+vif_df <- data.frame(
+  Variable = names(vif_values),
+  VIF = round(vif_values, 3)
+) %>% 
+  dplyr::select(c(Variable, VIF))
+
+# Sort by VIF (highest first)
+vif_df <- vif_df[order(-vif_df$VIF), ]
+
+vif_df %>%
+  kable(digits = 3,
+        caption = "Variance Inflation Factors (VIF) - Final Predictor Set",
+        row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+The final predictor set therefore consists of:
+
+- All 13 main effects, plus
+
+- The six controlled interaction terms
+
+This controlled inclusion strategy directly addresses the collinearity issues encountered in the previous project. By using SHAP-guided selection and standardization, we are able to retain richer behavioral representation from the psychometric data while maintaining model stability and full regulatory interpretability.
+
+### Models 
+
+#### Elastic Net Logistic Regression
+
+Elastic Net is a regularized extension of traditional logistic regression that combines the strengths of Ridge (L2) and Lasso (L1) penalization. It adds a penalty term to the loss function that simultaneously:
+
+- Shrinks unstable or noisy coefficients toward zero, and
+
+- Performs automatic variable selection by setting some coefficients exactly to zero 
+
+The mixing parameter alpha (set to 0.5 in this case) controls the balance between L1 and L2 penalties, while the regularization strength (lambda) is chosen automatically via cross-validation. This makes Elastic Net particularly suitable for high-dimensional or correlated predictor sets, such as psychometric factors and their interactions, while maintaining full interpretability of the final coefficients.
+
+```{r}
+# ====================== ELASTIC NET LOGISTIC REGRESSION ======================
+
+# Prepare matrices
+predictors_final <- c(psych_vars, 
+                      "R_HO_JD_CM_x_EM1_ES", "R_HO_TC3_DI_x_JD_CM",
+                      "R_HO_EM2_CO_x_VI4_ST", "R_HO_TC3_DI_x_TC2_OC",
+                      "R_HO_EM1_ES_x_TC1_AG", "R_HO_JD_CM_x_TC2_OC")
+
+X_train <- as.matrix(data_train_final[, predictors_final])
+y_train <- data_train_final[[target_var]]
+
+X_test  <- as.matrix(data_test_final[, predictors_final])
+y_test  <- data_test_final[[target_var]]
+
+# Cross-validated Elastic Net
+set.seed(123)
+
+cv_fit <- cv.glmnet(
+  x = X_train,
+  y = y_train,
+  family = "binomial",      # logistic regression
+  alpha = 0.5,              # 0.5 = balanced Elastic Net 
+  nfolds = 10,              # 10-fold CV
+  type.measure = "auc"      # optimise for AUC
+)
+
+# Best lambda
+best_lambda <- cv_fit$lambda.min
+
+# Final model at best lambda
+final_model <- glmnet(
+  x = X_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 0.5,
+  lambda = best_lambda
+)
+
+# Extract and format coefficients
+coef_df <- as.data.frame(as.matrix(coef(final_model)))
+coef_df$Variable <- rownames(coef_df)
+colnames(coef_df)[1] <- "Coefficient"
+
+# Clean up and sort
+coef_df <- coef_df[coef_df$Coefficient != 0, ]
+coef_df <- coef_df[order(-abs(coef_df$Coefficient)), ]
+
+# Add interpretation column
+coef_df$Effect <- ifelse(coef_df$Coefficient > 0, 
+                        "Increases risk", 
+                        "Decreases risk")
+
+coef_table <- coef_df %>%
+  select(Variable, Coefficient, Effect) %>%
+  kable(digits = 3, 
+        caption = "Elastic Net Logistic Regression Coefficients (Standardised Predictors)",
+        align = c("l", "r", "l"),
+        row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                full_width = FALSE) 
+
+coef_table
+```
+
+The final Elastic Net model retained 17 predictors (11 main effects + all 6 interaction terms) out of the original 19 candidates. The regularization successfully dropped two weaker main effects while preserving all six SHAP-identified interactions (some with small but non-zero coefficients). The retention of every interaction term confirms that the controlled screening process successfully preserved richer behavioral signals discovered during the XGBoost interaction discovery phase.
+
+All predictors were standardized (mean = 0, SD = 1) prior to modelling. Each coefficient therefore represents the change in the log-odds of default associated with a one standard deviation increase in that predictor, holding all other variables constant. The interaction terms show how the effect of one variable changes depending on the level of another. Most strong predictors have negative coefficients, indicating that higher scores on these DRA higher-order factors are associated with lower default risk.
+
+**Predict on Train & Test**
+
+```{r message = FALSE}
+# Predictions (probability of bad)
+pred_train_prob <- predict(final_model, newx = X_train, s = best_lambda, type = "response")
+pred_test_prob  <- predict(final_model, newx = X_test,  s = best_lambda, type = "response")
+
+# AUC / Gini
+auc_train <- roc(y_train, pred_train_prob[,1])$auc
+auc_test  <- roc(y_test,  pred_test_prob[,1])$auc
+
+cat("Train AUC:", round(auc_train, 4), " | Test AUC:", round(auc_test, 4), "\n")
+cat("Train Gini:", round(2 * (auc_train - 0.5), 4), " | Test Gini:", round(2 * (auc_test - 0.5), 4), "\n")
+```
+
+The final Elastic Net model achieved a Test Gini of 26.72% (AUC = 0.6336). While this is lower than the 32.7% Gini obtained in the earlier XGBoost model (Phase 1), the drop in performance is expected and reflects the core objective of phase 4: 
+
+- XGBoost is a highly flexible, non-linear ensemble capable of automatically capturing complex interactions and subtle patterns across features. 
+
+- The Elastic Net logistic regression is intentionally a linear, sparse, and fully transparent model. It uses only selected main effects plus a small number of explicit interactions, combined with regularization to ensure coefficient stability and prevent over-fitting.
+
+This trade-off - sacrificing some predictive power in exchange for interpretability, stability, and regulatory auditability - is fundamental to the hybrid ML-informed scorecard approach. The resulting model provides a stable, explainable decision layer suitable for regulated credit environments.
+
+#### Binning & Weight of Evidence 
+
+Weight of Evidence (WOE) binning converts continuous or categorical variables into discrete bins and replaces each bin with its corresponding WOE value. 
+
+WOE transformation offers several advantages:
+
+- Handles non-linearity and non-monotonic relationships naturally.
+
+- Produces monotonic, interpretable predictors that are highly suitable for regulatory logistic regression models.
+
+- Facilitates easy scorecard point allocation in later stages.
+
+**Diagnostic Evaluation of Weight of Evidence (WOE) Binning** 
+
+To determine whether this technique would improve model performance or interpretability, a systematic WOE binning diagnostic was performed on the full set of predictors (i.e., all standardised higher-order DRA factors and the 6 interaction terms). 
+
+For each predictor, the `scorecard` package was used to automatically bin the variable using the ChiMerge algorithm. Information Value (IV) was calculated both on the original continuous variable and after WOE transformation. Additionally, the number of direction changes in the WOE trend was assessed to evaluate monotonicity. A positive Benefit Score would indicate that WOE binning improves predictive power. All analysis was conducted exclusively on the training sample. 
+
+```{r results = FALSE}
+set.seed(42)
+
+# === FULL SET: Main effects + Interactions ===
+full_predictors <- c(psych_vars, 
+                     "R_HO_JD_CM_x_EM1_ES", 
+                     "R_HO_TC3_DI_x_JD_CM",
+                     "R_HO_EM2_CO_x_VI4_ST", 
+                     "R_HO_TC3_DI_x_TC2_OC",
+                     "R_HO_EM1_ES_x_TC1_AG", 
+                     "R_HO_JD_CM_x_TC2_OC")
+
+# Diagnostic function
+evaluate_woe_potential <- function(data, vars, target_var) {
+  
+results <- list()
+  
+  for (var in vars) {
+    suppressWarnings(suppressMessages({
+      
+      bins <- woebin(data,
+                     y = target_var,
+                     x = var,
+                     binning_method = "chimerge",
+                     positive = 1,
+                     print_info = FALSE)   
+      
+      iv_raw <- iv(data, y = target_var, x = var)$info_value[1]
+      iv_woe <- bins[[1]]$total_iv[1]
+      
+      woe_values <- bins[[1]]$woe
+      direction_changes <- sum(diff(sign(diff(woe_values))) != 0)
+      
+      results[[var]] <- data.frame(
+        Variable          = var,
+        IV_Raw            = round(iv_raw, 3),
+        IV_WOE            = round(iv_woe, 3),
+        Benefit           = round(iv_woe - iv_raw, 3),
+        Direction_Changes = direction_changes,
+        Num_Bins          = nrow(bins[[1]])
+      )
+    }))
+  }
+  
+  # Only show final summary
+  summary_df <- do.call(rbind, results)
+  summary_df <- summary_df[order(summary_df$Benefit), ]   # worst to best
+  invisible(summary_df)
+}
+
+woe_full_eval <- evaluate_woe_potential(data_train_final, full_predictors, target_var)
+```
+
+```{r}
+summary_table <- woe_full_eval %>%
+  select(Variable, IV_Raw, IV_WOE, Benefit, Direction_Changes, Num_Bins) %>%
+  arrange(Benefit)   # lowest (worst) Benefit first
+
+summary_table %>%
+  kable(digits = 3,
+        caption = "WOE Binning Diagnostic - All Psychometric Predictors and Interactions",
+        col.names = c("Variable", "IV (Raw)", "IV (WOE)", "Benefit Score", 
+                      "Direction Changes", "Number of Bins"),
+        row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+The diagnostic revealed that WOE binning reduced predictive power for every variable in the set (benefit scores were consistently negative). Even the interaction terms, which were expected to potentially exhibit more complex relationships, showed notable information loss when binned.
+
+This outcome confirms that the standardised continuous DRA factors and their interactions already maintain strong, largely monotonic relationships with the target. Discretising them would result in unnecessary information loss and reduced granularity contrary to the goal of preserving ML-derived feature richness. Based on these results, no variables were WOE-binned to maximize predictive signal. 
+
+#### Bayesian Logistic Regression
+
+As a final robustness check within Stage 4, a Bayesian logistic regression was fitted using the same standardised higher-order DRA factors and interaction terms. Weakly informative normal priors (N(0, 2.5)) were applied to all coefficients and the intercept. The model was estimated using Markov Chain Monte Carlo (MCMC) sampling with 4 chains. The model showed excellent convergence. 
+
+This Bayesian approach offers several advantages:
+
+- Naturally incorporates uncertainty through posterior distributions.
+
+- Provides credible intervals that are more intuitive than frequentist confidence intervals.
+
+- Regularising priors help stabilize estimates in the presence of correlated predictors.
+
+```{r bayesian-model, cache=TRUE, message=FALSE, warning=FALSE, results='hide'}
+# ====================== BAYESIAN LOGISTIC REGRESSION ====================== # 
+
+# Load pre-fitted model 
+if (file.exists("bayes_model_final.rds")) {
+  bayes_brm <- readRDS("bayes_model_final.rds")
+  cat("Bayesian model loaded from disk.\n")
+} else {
+  # Only run if model doesn't exist yet
+  library(brms)
+  bayes_brm <- brm(
+    formula = as.formula(paste(target_var, "~", paste(full_predictors, collapse = " + "))),
+    data = data_train_final[, c(full_predictors, target_var)],
+    family = bernoulli(link = "logit"),
+    prior = c(
+      set_prior("normal(0, 2.5)", class = "Intercept"),
+      set_prior("normal(0, 2.5)", class = "b")
+    ),
+    chains = 4, iter = 2000, warmup = 1000,
+    cores = parallel::detectCores(),
+    seed = 123,
+    control = list(adapt_delta = 0.95),
+    verbose = FALSE,
+    refresh = 0
+  )
+  saveRDS(bayes_brm, "bayes_model_final.rds")
+}
+```
+
+```{r message = FALSE, warning = FALSE}
+# ====================== RESULTS ======================
+
+# Extract fixed effects
+coef_table <- fixef(bayes_brm) %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  rename(Estimate = Estimate,
+         `Est.Error` = Est.Error,
+         `Lower 95%` = Q2.5,
+         `Upper 95%` = Q97.5)
+
+# Add effect direction
+coef_table <- coef_table %>%
+  mutate(Effect = ifelse(Estimate > 0, "Increases risk", "Decreases risk"))
+
+bayes_table <- coef_table %>%
+  select(Variable, Estimate, `Est.Error`, `Lower 95%`, `Upper 95%`, Effect) %>%
+  kable(digits = 3,
+        caption = "Bayesian Logistic Regression Results (Posterior Summary)",
+        align = c("l", "r", "r", "r", "r", "l")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  column_spec(2, color = ifelse(coef_table$Estimate > 0, "red", "darkgreen")) %>%
+  row_spec(1, bold = TRUE)  # Highlight intercept
+
+bayes_table
+```
+
+Posterior coefficient estimates were highly consistent with the Elastic Net model, confirming the stability of the main effects and selected interactions.
+
+**Predict on Train & Test**
+
+```{r message = FALSE}
+# === OUT-OF-SAMPLE PREDICTIONS ===
+# Get predicted probabilities on train set
+pred_train_prob <- predict(bayes_brm, 
+                          newdata = data_train_final, 
+                          type = "response")
+
+# Get predicted probabilities on test set
+pred_test_prob <- predict(bayes_brm, 
+                          newdata = data_test_final, 
+                          type = "response")
+
+# Calculate AUC and Gini
+auc_train <- roc(data_train_final[[target_var]], pred_train_prob[,1])$auc
+gini_train <- 2 * (auc_train - 0.5)
+
+auc_test <- roc(data_test_final[[target_var]], pred_test_prob[,1])$auc
+gini_test <- 2 * (auc_test - 0.5)
+
+cat("Bayesian Model Performance\n")
+cat("Train AUC :", round(auc_train, 4), " | Test AUC :", round(auc_test, 4), "\n")
+cat("Train Gini:", round(gini_train, 4), " | Test Gini:", round(gini_test, 4), "\n")
+```
+
+Out-of-sample performance on the hold-out test set yielded a Gini of 26.1%, demonstrating that the hybrid psychometric model generalizes reasonably well.
+
+### PD Calibration and Scorecard Development 
+
+The final Elastic Net logistic regression model was selected as the production model. Predicted probabilities were calibrated using Platt scaling (logistic calibration) to ensure well-calibrated Probability of Default (PD) estimates. A traditional scorecard was created by scaling the calibrated PDs to a 0–1000 score range, where higher scores indicate lower risk.
+
+```{r}
+# 1. Raw predictions
+pred_train_raw <- predict(final_model, newx = X_train, s = best_lambda, type = "response")[,1]
+pred_test_raw  <- predict(final_model, newx = X_test,  s = best_lambda, type = "response")[,1]
+
+# 2. Calibration model
+cal_model <- glm(y_train ~ pred_train_raw, family = binomial(link = "logit"))
+
+# 3. Calibrated probabilities 
+newdata_train <- data.frame(pred_train_raw = pred_train_raw)
+newdata_test  <- data.frame(pred_train_raw = pred_test_raw)   
+
+cal_train_prob <- predict(cal_model, newdata = newdata_train, type = "response")
+cal_test_prob  <- predict(cal_model, newdata = newdata_test,  type = "response")
+
+# 4. Assign to data
+data_train_final <- as.data.frame(data_train_final)
+data_test_final  <- as.data.frame(data_test_final)
+
+data_train_final[["PD_Calibrated"]] <- cal_train_prob
+data_test_final[["PD_Calibrated"]]  <- cal_test_prob
+
+data_train_final[["Score"]] <- round(1000 * (1 - cal_train_prob))
+data_test_final[["Score"]]  <- round(1000 * (1 - cal_test_prob))
+```
+
+The final scorecard was segmented into six risk rating bands (A to F), with Band A representing the lowest risk and Band F the highest risk. The banding structure demonstrates strong rank-ordering power, with observed bad rates increasing monotonically from Band A (~10–11%) to Band F (~36–38%) in both the development and hold-out test samples.
+
+Importantly, the performance is highly consistent between the development and test sets, indicating good generalisation and stable calibration. This monotonic relationship and out-of-sample stability support the use of these bands for clear business decision rules. 
+
+```{r}
+# === RISK BANDS A TO F ===
+
+# Create breaks based on TRAIN scores only 
+breaks <- quantile(data_train_final$Score, probs = seq(0, 1, length.out = 7))
+
+# Apply bands
+data_train_final$Risk_Band <- cut(data_train_final$Score, 
+                                  breaks = breaks,
+                                  labels = c("F", "E", "D", "C", "B", "A"),
+                                  include.lowest = TRUE)
+
+data_test_final$Risk_Band <- cut(data_test_final$Score, 
+                                 breaks = breaks,
+                                 labels = c("F", "E", "D", "C", "B", "A"),
+                                 include.lowest = TRUE)
+
+# Summary Table
+band_summary <- function(df) {
+  df %>%
+    group_by(Risk_Band) %>%
+    summarise(
+      N = n(),
+      Bad_Rate = round(mean(get(target_var), na.rm = TRUE) * 100, 2),
+      Avg_Score = round(mean(Score), 1),
+      Min_Score = min(Score),
+      Max_Score = max(Score),
+      .groups = "drop"
+    ) %>%
+    arrange(Risk_Band)
+}
+
+train_bands <- band_summary(data_train_final)
+test_bands  <- band_summary(data_test_final)
+
+# Combine Train and Test summaries
+combined_bands <- train_bands %>%
+  rename_with(~ paste0(., "_Train"), -Risk_Band) %>%
+  left_join(
+    test_bands %>% rename_with(~ paste0(., "_Test"), -Risk_Band),
+    by = "Risk_Band"
+  )
+
+combined_bands %>%
+  select(Risk_Band,
+         `N Train` = N_Train, `Bad Rate Train` = Bad_Rate_Train, `Avg Score Train` = Avg_Score_Train,
+         `N Test` = N_Test,   `Bad Rate Test` = Bad_Rate_Test,   `Avg Score Test` = Avg_Score_Test) %>%
+  kable(digits = 2,
+        caption = "Risk Bands A to F — Train vs Test Performance") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) %>%
+  column_spec(1, bold = TRUE) %>%
+  add_header_above(c(" " = 1, "Development Sample" = 3, "Hold-out Test Sample" = 3))
+```
+
+```{r}
+# Prepare data for plotting
+plot_data <- train_bands %>%
+  select(Risk_Band, Bad_Rate) %>%
+  rename(Bad_Rate_Train = Bad_Rate) %>%
+  left_join(
+    test_bands %>% select(Risk_Band, Bad_Rate) %>% rename(Bad_Rate_Test = Bad_Rate),
+    by = "Risk_Band"
+  ) %>%
+  pivot_longer(cols = c(Bad_Rate_Train, Bad_Rate_Test),
+               names_to = "Sample", 
+               values_to = "Bad_Rate") %>%
+  mutate(Sample = ifelse(Sample == "Bad_Rate_Train", "Development Sample", "Hold-out Test Sample"))
+
+# Combined Plot
+ggplot(plot_data, aes(x = Risk_Band, y = Bad_Rate, fill = Sample)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = paste0(round(Bad_Rate, 1), "%")),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 4, fontface = "bold") +
+  scale_fill_manual(values = c("Development Sample" = "#1f77b4", 
+                               "Hold-out Test Sample" = "#ff7f0e")) +
+  labs(title = "Observed Bad Rate by Risk Band",
+       subtitle = "Strong monotonic relationship and good out-of-sample stability",
+       x = "Risk Band (F = Highest Risk, A = Lowest Risk)",
+       y = "Bad Rate (%)",
+       fill = "Sample") +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    legend.position = "top"
+  )
+```
+The chart above illustrates the observed bad rates across the six risk rating bands (A to F) for both the development sample and the hold-out test sample. A clear and consistent monotonic trend is evident, with bad rates increasing steadily from Band A (lowest risk) to Band F (highest risk).
+
+### Summary 
+
+Following the hybrid ML-informed logistic regression methodology established in the previous project, Phase 4 focused on transforming the psychometric DRA higher-order factors into a stable, explainable input set for the final logistic regression decision layer, while preserving the predictive richness discovered through advanced ML techniques.
+
+Key steps included:
+
+- Univariate IV screening and standardisation of DRA factors.
+
+- Controlled discovery and inclusion of high-value interaction terms using XGBoost and SHAP interaction values.
+
+- Comprehensive diagnostics (correlation, VIF, and WOE binning evaluation), which confirmed that retaining the factors in standardised continuous form was optimal.
+
+- Fitting of both Elastic Net penalised logistic regression and Bayesian logistic regression models.
+
+- PD calibration and development of a traditional scorecard with six risk rating bands (A to F).
+
+The strong agreement between the Elastic Net (frequentist penalised) and Bayesian approaches provides high confidence in the robustness and stability of the selected features and interactions. This consistency directly addresses the collinearity and instability challenges encountered in the prior project.
+
+### Conclusion 
+
+Phase 4 successfully delivered a regulator-ready psychometric decision layer that balances predictive power with interpretability and stability. This hybrid modelling approach — combining ML-driven interaction discovery and controlled feature engineering with a transparent Elastic Net logistic regression decision layer — aligns strongly with the risk-based and proportionate Model Risk Management principles outlined in the recently issued SR 26-2 guidance.
+
+By prioritising explainability, coefficient stability, and robust validation while retaining meaningful behavioral signal from the DRA, the resulting model is well-positioned for regulatory review and practical deployment in credit decisioning.
+
+### References 
+
+Seitshiro, M. B., & Govender, S. (2024). Credit risk prediction with and without weights of evidence using quantitative learning models. Cogent Economics & Finance, 12(1). https://doi.org/10.1080/23322039.2024.2338971
+
+Shukla, D., & Gupta, S. (2024, November). Feature Engineering Techniques to Enhance Credit Scoring Models. In 2024 6th International Conference on Electrical, Control and Instrumentation Engineering (ICECIE) (pp. 1-5). IEEE.
+
+Siddiqi, N. (2017). Scorecard Development Process, Stage 3. In Intelligent Credit Scoring: Building and Implementing Better Credit Risk Scorecards (pp. 131–148). John Wiley & Sons, Inc. https://doi.org/10.1002/9781119282396.ch8
